@@ -1160,77 +1160,78 @@ module Main =
         cublas.Stream <- str.Stream
         cublas.Geam(transa, transb, a_row, a_col, alpha, ext_a A, lda, ext_b B, ldb, beta, ext_c C, ldc)
 
-    // Uncomment gemm to uncover the bug.
+    // Uncomment gemm to manifest the bug. 
+    // The test in Program.fs will not be detected with this function uncommented.
 
     /// General matrix-matrix multiply from cuBLAS. Inplace version
-    let inline gemm 
-            (str: CudaStream) transa transb 
-            (alpha: float32) (ext_a: _ -> CudaDeviceVariable<float32>, A)
-                             (ext_b: _ -> CudaDeviceVariable<float32>, B)
-            (beta: float32)  (ext_c: _ -> CudaDeviceVariable<float32>, C) =
-
-        // -------
-
-        // These two are meant to be called from inside gemm as they lack boundary checks.
-        // I've added them to enhance gemm's vector handling capabilities for online learning
-        // tasks.
-
-        /// o <- alpha * op(A) * x + beta * o
-        /// Matrix-vector multiplication. Inplace version.
-        let inline gemv
-                (str: CudaStream) transa transb
-                (alpha:float32) (ext_a, A) 
-                                (ext_x, x) 
-                (beta:float32)  (ext_o, o) =
-            let m = rows A
-            let n = cols A
-            let lda = m
-            cublas.Stream <- str.Stream
-            cublas.Gemv(transa, m, n, alpha, ext_a A, lda, ext_x x, 1, beta, ext_o o, 1)
-
-        // A <- alpha * x * yT + beta * A (outer product)
-        let inline ger 
-                (str: CudaStream)
-                (alpha: float32) (ext_x, x)
-                                 (ext_y, y)
-                (beta: float32)  (ext_a, a) =
-            let dom_x = max (rows x) (cols x)
-            if beta <> 1.0f then geam str nT nT beta (ext_a, a) 0.0f (ext_a, a) (ext_a, a) 
-            cublas.Stream <- str.Stream
-            cublas.Ger(alpha, ext_x x, 1, ext_y y, 1, ext_a a, dom_x)
-
-        // -------
-
-        let inline is_vector (x: ^a) = rows x = 1 || cols x = 1
-
-        let a_col = if transa = nT then cols A else rows A
-        let b_row = if transb = nT then rows B else cols B
-        if a_col <> b_row then failwithf "a_col(%i) <> b_row(%i) in gemm!" a_col b_row
-        let m = if transa = nT then rows A else cols A
-        let n = if transb = nT then cols B else rows B
-        let k = a_col
-        let lda = if transa = nT then m else k
-        let ldb = if transb = nT then k else n
-        let ldc = m
-
-        if m <> rows C || n <> cols C then failwithf "m(%i) <> rows C(%i) || n(%i) <> cols C(%i)" m (rows C) n (cols C)
-
-        // If is outer product call ger
-        if a_col = 1 && b_row = 1 then 
-            ger str alpha (ext_a, A) (ext_b, B) beta (ext_c, C)
-        // If the vector is on the right side or both are vectors call gemv normally.
-        elif is_vector B then 
-            gemv str transa transb alpha (ext_a,A) (ext_b,B) beta (ext_c,C)
-        // If the vector is on the left side call gemv with the arguments switched and transposed
-        // It does not actually transpose them, just their views. The function should work regardless.
-        elif is_vector A then
-            let opta = if transa = nT then T else nT
-            let optb = if transb = nT then T else nT
-            gemv str optb opta alpha (ext_b,B) (ext_a,A) beta (ext_c,C)
-        // Just do the standard matrix multiply
-        else
-            cublas.Stream <- str.Stream
-            cublas.Gemm(transa, transb, m, n, k, alpha, ext_a A, lda, ext_b B, ldb, beta, ext_c C, ldc)
+//    let inline gemm 
+//            (str: CudaStream) transa transb 
+//            (alpha: float32) (ext_a: _ -> CudaDeviceVariable<float32>, A)
+//                             (ext_b: _ -> CudaDeviceVariable<float32>, B)
+//            (beta: float32)  (ext_c: _ -> CudaDeviceVariable<float32>, C) =
+//
+//        // -------
+//
+//        // These two are meant to be called from inside gemm as they lack boundary checks.
+//        // I've added them to enhance gemm's vector handling capabilities for online learning
+//        // tasks.
+//
+//        /// o <- alpha * op(A) * x + beta * o
+//        /// Matrix-vector multiplication. Inplace version.
+//        let inline gemv
+//                (str: CudaStream) transa transb
+//                (alpha:float32) (ext_a, A) 
+//                                (ext_x, x) 
+//                (beta:float32)  (ext_o, o) =
+//            let m = rows A
+//            let n = cols A
+//            let lda = m
+//            cublas.Stream <- str.Stream
+//            cublas.Gemv(transa, m, n, alpha, ext_a A, lda, ext_x x, 1, beta, ext_o o, 1)
+//
+//        // A <- alpha * x * yT + beta * A (outer product)
+//        let inline ger 
+//                (str: CudaStream)
+//                (alpha: float32) (ext_x, x)
+//                                 (ext_y, y)
+//                (beta: float32)  (ext_a, a) =
+//            let dom_x = max (rows x) (cols x)
+//            if beta <> 1.0f then geam str nT nT beta (ext_a, a) 0.0f (ext_a, a) (ext_a, a) 
+//            cublas.Stream <- str.Stream
+//            cublas.Ger(alpha, ext_x x, 1, ext_y y, 1, ext_a a, dom_x)
+//
+//        // -------
+//
+//        let inline is_vector (x: ^a) = rows x = 1 || cols x = 1
+//
+//        let a_col = if transa = nT then cols A else rows A
+//        let b_row = if transb = nT then rows B else cols B
+//        if a_col <> b_row then failwithf "a_col(%i) <> b_row(%i) in gemm!" a_col b_row
+//        let m = if transa = nT then rows A else cols A
+//        let n = if transb = nT then cols B else rows B
+//        let k = a_col
+//        let lda = if transa = nT then m else k
+//        let ldb = if transb = nT then k else n
+//        let ldc = m
+//
+//        if m <> rows C || n <> cols C then failwithf "m(%i) <> rows C(%i) || n(%i) <> cols C(%i)" m (rows C) n (cols C)
+//
+//        // If is outer product call ger
+//        if a_col = 1 && b_row = 1 then 
+//            ger str alpha (ext_a, A) (ext_b, B) beta (ext_c, C)
+//        // If the vector is on the right side or both are vectors call gemv normally.
+//        elif is_vector B then 
+//            gemv str transa transb alpha (ext_a,A) (ext_b,B) beta (ext_c,C)
+//        // If the vector is on the left side call gemv with the arguments switched and transposed
+//        // It does not actually transpose them, just their views. The function should work regardless.
+//        elif is_vector A then
+//            let opta = if transa = nT then T else nT
+//            let optb = if transb = nT then T else nT
+//            gemv str optb opta alpha (ext_b,B) (ext_a,A) beta (ext_c,C)
+//        // Just do the standard matrix multiply
+//        else
+//            cublas.Stream <- str.Stream
+//            cublas.Gemm(transa, transb, m, n, k, alpha, ext_a A, lda, ext_b B, ldb, beta, ext_c C, ldc)
 
 
     /// Does not only check, but also sets the undefined nodes to Dead or Alive.
