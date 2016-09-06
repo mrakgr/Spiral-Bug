@@ -1,5 +1,7 @@
 ﻿// Basic reverse mode AD on the GPU. This v4 of Spiral is focused on removing the global state.
-// Goto line 1165 and uncomment the gemm function to find the testing bug.
+// My recent experience with Haskell has shown me the way to weave the state across function calls.
+// I will also add array slicing operations. Streams will be removed as their benefit is too marginal to
+// be worth the maintenance cost. Also I won't bother merging 2d and 4d operations.
 
 namespace SpiralV4
 
@@ -50,9 +52,14 @@ module Main =
         let cuda_callback = CUstreamCallback(callb)
         str.AddCallback(cuda_callback,ptr_to_aux,CUStreamAddCallbackFlags.None)
 
+//     Some formal rules for memory allocation
+//    - On first allocation the memory is initialized to zero
+//    - On the forward pass the primals of the objects in the ObjectPool are set to zero inside the functions during usage
+//    - On the forward pass the adjoints of the objects in the ObjectPool are set to zero inside the ObjectPool
+//    - During the optimization phase, the optimizers are responsible for setting the adjoints of the weight nodes to zero.
+
     // Helper functions
-    let inline dispose v =
-        (^b: (member Dispose: unit -> unit) v)
+    let inline dispose v = (^b: (member Dispose: unit -> unit) v)
 
     /// Copies a host array to device.
     let inline to_dev (host_ar: 't []) =
@@ -93,12 +100,12 @@ module Main =
 
         static member CreatePrimalOnly(size: int) =
             new CudaDeviceVariable<float32>(SizeT size)
-            |> fun x -> x.Memset(0u); x // Zeroes the variable (saves me from having to zero out the adjoint)
+            |> fun x -> x.Memset(0u); x // Zeroes the variable (saves me from having to zero out the adjoint on the first run)
             |> PrimalOnly
 
         static member CreatePA(size: int) =
             new CudaDeviceVariable<float32>(SizeT (size*2))
-            |> fun x -> x.Memset(0u); x // Zeroes the variable (saves me from having to zero out the adjoint)
+            |> fun x -> x.Memset(0u); x // Zeroes the variable (saves me from having to zero out the adjoint on the first run)
             |> PrimalAndAdjoint
 
         member private t.Resize(size: int) =
@@ -1160,9 +1167,6 @@ module Main =
         cublas.Stream <- str.Stream
         cublas.Geam(transa, transb, a_row, a_col, alpha, ext_a A, lda, ext_b B, ldb, beta, ext_c C, ldc)
 
-    // Uncomment gemm to manifest the bug. 
-    // The test in Program.fs will not be detected with this function uncommented.
-
     /// General matrix-matrix multiply from cuBLAS. Inplace version
     let inline gemm 
             (str: CudaStream) transa transb 
@@ -1233,815 +1237,697 @@ module Main =
             cublas.Stream <- str.Stream
             cublas.Gemm(transa, transb, m, n, k, alpha, ext_a A, lda, ext_b B, ldb, beta, ext_c C, ldc)
 
-            
+
     /// Does not only check, but also sets the undefined nodes to Dead or Alive.
-//    let inline deadness_check c a (f : unit -> unit) =
-//        match isDead c with
-//        | Undefined -> failwith "The upper node should not be undefined."
-//        | Dead -> // If the upper node is dead no backpropagation is done.
-//            match isDead a with
-//            | Undefined -> deadIs a Dead
-//            | Dead | Alive -> () // If the bottom node is Alive do not modify it to be Dead as there exists a path from elsewhere through it.
-//        | Alive -> 
-//            deadIs a Alive
-//            f()
-//
-//    type StanState =
-//        {
-//        IsInferenceOnly: bool
-//        Workspace: Workspace
-//        Str: CudaStream
-//        Mem: ObjectPool
-//        Tape: Stack<unit -> unit>
-//        }
-//
-//        static member create(?is_inference_only) =
-//            {IsInferenceOnly=defaultArg is_inference_only false; 
-//             Workspace=new Workspace(); Str=new CudaStream(); 
-//             Mem=new ObjectPool(); Tape=Stack()}
-//
-//        member t.WithIsInferenceOnly x =
-//            {t with IsInferenceOnly=x}
-//
-//        member t.Dispose() =
-//            t.Workspace.Dispose()
-//            t.Str.Dispose()
-//            t.Mem.Dispose()
-//            t.Tape.Clear()
-//
-//        interface IDisposable with
-//            member t.Dispose() = t.Dispose()
-//
-//    let inline with_is_inference_only (x: ^a) v =
-//        (^a: (member WithIsInferenceOnly: bool -> ^a) x, v)
-//
-//    let inline tape (x: ^a) =
-//        (^a: (member Tape: Stack<unit -> unit>) x)
-//
-//    let inline mem (x: ^a) =
-//        (^a: (member Mem: ObjectPool) x)
-//
-//    let inline str (x: ^a) =
-//        (^a: (member Str: CudaStream) x)
-//
-//    let inline workspace (x: ^a) =
-//        (^a: (member Workspace: Workspace) x)
-//
-//    let inline is_inference_only (x: ^a) =
-//        (^a: (member IsInferenceOnly: bool) x)
-//
-//    /// Gets a dM the same size as the first one from the object pool.
-//    let inline getdMLike (x: ^a) (p: ObjectPool) is_constant is_inference_only str = // TODO: Like copy, refactor this one too.
-//        (^a: (member GetFromObjectPool: ObjectPool * bool * bool * CudaStream -> ^a) x, p, is_constant, is_inference_only, str)
-//
-//    /// Copies the dM type using the object pool.
-//    let inline copy (x: ^a) is_constant state =
-//        (^a: (member CopyUsingObjectPool: ObjectPool * bool * bool * CudaStream -> ^a) x, mem state, is_constant,  is_inference_only state , str state)
-//
-//    ///// Matrix-matrix multiply.
-//    let inline private matmult' (prev_output : d2M option) (a, b) (state: ^state) =
-//        let c = 
-//            match prev_output with
-//            | None ->
-//                let num_rows = rows a
-//                let num_cols = cols b
-//                (mem state).Getd2M(false,(num_rows,num_cols),(is_inference_only state),(str state))
-//                |> fun c ->
-//                    gemm (str state) nT nT 1.0f (P' a) (P' b) 0.0f (P' c)
-//                    c
-//            | Some c ->
-//                gemm (str state) nT nT 1.0f (P' a) (P' b) 1.0f (P' c)
-//                c
-//    
-//        if (is_inference_only state) = false then
-//            if hasAdjoint a then 
-//                let matmult_backward_left () = 
-//                    deadness_check c a <| fun _ -> 
-//                        gemm (str state) nT T 1.0f (A' c) (P' b) 1.0f (A' a)
-//                (tape state).Push(matmult_backward_left)
-//
-//            if hasAdjoint b then 
-//                let matmult_backward_right () = 
-//                    deadness_check c b <| fun _ -> 
-//                        gemm (str state) T nT 1.0f (P' a) (A' c) 1.0f (A' b)
-//                (tape state).Push(matmult_backward_right)
-//        c, state
-//
-//    let inline matmult a b = matmult' None (a, b)
-//
-//    let inline tensor_add' add_to_left alpha (left : ^a) beta (right : ^a) (state: ^state) =
-//        let left_nchw = nchw left
-//        let right_nchw = nchw right
-//        let leftDesc = (mem state).GetTensorDescriptor left_nchw
-//        let rightDesc = (mem state).GetTensorDescriptor right_nchw
-//
-//        let output = 
-//            if add_to_left = false then
-//                getdMLike left (mem state) false (is_inference_only state) (str state)
-//                |> fun output ->
-//                    geam (str state) nT nT 1.0f (P' left) 0.0f (P' output) (P' output)
-//                    output
-//            else 
-//                left
-//
-//        if left_nchw <> right_nchw then
-//            cudnn.SetStream (str state)
-//            cudnn.AddTensor(beta,rightDesc,extract_primal' right, alpha,leftDesc,extract_primal' output) // Add right to output.
-//        else 
-//            geam (str state) nT nT beta (P' right) alpha (P' output) (P' output)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint right then 
-//                let tensor_add_right_backwards () =
-//                    deadness_check output right
-//                    <| fun _ ->
-//                        if left_nchw = right_nchw then
-//                            saxpy (str state) beta (A' output) (A' right)
-//                        else
-//                            cudnn.SetStream (str state)
-//                            let left_nchw = nchwBiasAdd left // Ugly hack to get cuDNN to work with 2D matrices.
-//                            let right_nchw = nchwBiasAdd right
-//                            let leftDesc = (mem state).GetTensorDescriptor left_nchw
-//                            let rightDesc = (mem state).GetTensorDescriptor right_nchw
-//                            cudnn.ConvolutionBackwardBias(beta,leftDesc,extract_adjoint' output,1.0f,rightDesc,extract_adjoint' right)
-//
-//                (tape state).Push(tensor_add_right_backwards)
-//
-//            if add_to_left = false && hasAdjoint left then // No point in adding the adjoint to itself.
-//                let tensor_add_left_backwards () = 
-//                    deadness_check output left 
-//                    <| fun _ -> 
-//                        saxpy (str state) alpha (A' output) (A' left)
-//                (tape state).Push(tensor_add_left_backwards)
-//        output, state
-//
-//    let inline linear_layer_matmult (mm: (d2M*d2M) []) (bias: d2M option) (state: ^state) =
-//        mm
-//        |> Array.fold (fun (prev_output,state) input -> 
-//            matmult' prev_output input state
-//            |> fun (input',state') -> (Some input',state')
-//            ) (None,state)
-//        |>  function
-//            | None, _ -> failwith "There must be one input in mm"
-//            | Some left, state ->
-//                match bias with
-//                | None -> left, state
-//                | Some right -> tensor_add' true 1.0f left 1.0f right state
-//
-//    /// The activation function. Zeroes out the target primal during the call.
-//    let inline activation_forward mode (input : ^a) (state: ^state) =
-//        let input_sizes = nchw input
-//        let srcTensorDesc = (mem state).GetTensorDescriptor input_sizes
-//
-//        let output = getdMLike input (mem state) false (is_inference_only state) (str state)
-//
-//        cudnn.SetStream (str state)
-//        cudnn.ActivationForward(mode,1.0f,srcTensorDesc,extract_primal' input,0.0f,srcTensorDesc,extract_primal' output)
-//        if (is_inference_only state) = false then
-//            if hasAdjoint input then 
-//                let activation_backward () =
-//                    deadness_check output input 
-//                    <| fun _ -> 
-//                        cudnn.SetStream (str state)
-//                        cudnn.ActivationBackward(mode,1.0f,srcTensorDesc,extract_primal' output,srcTensorDesc,extract_adjoint' output,srcTensorDesc,extract_primal' input,1.0f,srcTensorDesc,extract_adjoint' input)
-//                (tape state).Push(activation_backward)
-//        output, state
-//
-//    /// The pooling function. Zeroes out the target primal during the call.
-//    let inline pooling_forward p (input : d4M) (state: ^state) =
-//        let poolingDescriptor = (mem state).GetPoolingDescriptor p
-//        let input_sizes = input.nchw
-//        let srcTensorDesc = (mem state).GetTensorDescriptor input_sizes
-//        let dest_sizes = poolingDescriptor.GetPooling2dForwardOutputDim srcTensorDesc
-//
-//        let output = (mem state).Getd4M(false,input.nchw,(is_inference_only state),(str state))
-//
-//        let dstTensorDesc = (mem state).GetTensorDescriptor dest_sizes
-//
-//        cudnn.SetStream (str state)
-//        cudnn.PoolingForward(poolingDescriptor,1.0f,srcTensorDesc,extract_primal' input,0.0f,dstTensorDesc,extract_primal' output)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint input then 
-//                let pooling_backward () =
-//                    deadness_check output input 
-//                    <| fun _ ->
-//                        cudnn.SetStream (str state)
-//                        cudnn.PoolingBackward(poolingDescriptor,1.0f,srcTensorDesc,extract_primal' output, srcTensorDesc,
-//                                              extract_adjoint' output,dstTensorDesc,extract_primal' input,1.0f,dstTensorDesc,extract_adjoint' input)
-//                (tape state).Push(pooling_backward)
-//        output, state
-//
-//
-//    let inline private convolutional_forward' (prev_output: d4M option) (convPar, data : d4M, filter : d4M) (state: ^state) =
-//        let data_sizes = data.nchw
-//        let filter_sizes = filter.nchw
-//
-//        let srcTensorDesc = (mem state).GetTensorDescriptor data_sizes
-//    
-//        let filterDesc = (mem state).GetFilterDescriptor filter_sizes
-//        let convDesc = (mem state).GetConvolutionDescriptor convPar
-//
-//        let dims, output = 
-//            let dims = convDesc.GetConvolution2dForwardOutputDim(srcTensorDesc,filterDesc)
-//            match prev_output with
-//            | Some prev_output ->
-//                let prev_dims = prev_output.nchw
-//                if dims <> prev_dims then failwith "dims <> prev_dims in linear_layer_conv"
-//                prev_dims, prev_output
-//            | None ->
-//                dims, (mem state).Getd4M(false,dims,(is_inference_only state),(str state))
-//
-//        let dstTensorDesc = (mem state).GetTensorDescriptor dims
-//
-//        let algo = 
-//            cudnn.GetConvolutionForwardAlgorithm(
-//                srcTensorDesc,filterDesc,convDesc,dstTensorDesc,
-//                cudnnConvolutionFwdPreference.PreferFastest,SizeT 0)
-//        let _ = 
-//            let workspace = 
-//                cudnn.GetConvolutionForwardWorkspaceSize(srcTensorDesc, filterDesc, convDesc, dstTensorDesc, algo) 
-//                |> int |> (workspace state).ResizeIf
-//
-//            let beta = 
-//                match prev_output with
-//                | None -> 0.0f
-//                | Some _ -> 1.0f
-//
-//            cudnn.SetStream (str state)
-//            cudnn.ConvolutionForward(1.0f,srcTensorDesc,extract_primal' data,filterDesc,extract_primal' filter,convDesc,algo,workspace,beta,dstTensorDesc,extract_primal' output) // Don't zero out the previous output.
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint filter then 
-//                let convolution_backwards_filter () =
-//                    deadness_check output filter 
-//                    <| fun _ ->
-//                        let algo = 
-//                            cudnn.GetConvolutionBackwardFilterAlgorithm(
-//                                srcTensorDesc,dstTensorDesc,convDesc,filterDesc,
-//                                cudnnConvolutionBwdFilterPreference.PreferFastest,SizeT 0)
-//
-//                        let workspace =
-//                            cudnn.GetConvolutionBackwardFilterWorkspaceSize(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,algo) 
-//                            |> int |> (workspace state).ResizeIf
-//
-//                        cudnn.SetStream (str state)
-//                        cudnn.ConvolutionBackwardFilter(
-//                            1.0f,srcTensorDesc,extract_primal' data,dstTensorDesc,extract_adjoint' output,
-//                            convDesc,algo,workspace,1.0f,filterDesc,extract_adjoint' filter)
-//
-//                (tape state).Push(convolution_backwards_filter)
-//
-//            if hasAdjoint data then 
-//                let convolution_backwards_data () =
-//                    deadness_check output data 
-//                    <| fun _ ->
-//                        let algo = 
-//                            cudnn.GetConvolutionBackwardDataAlgorithm(
-//                                filterDesc,dstTensorDesc,convDesc,srcTensorDesc,
-//                                cudnnConvolutionBwdDataPreference.PreferFastest,SizeT 0)
-//
-//                        let workspace = 
-//                            cudnn.GetConvolutionBackwardDataWorkspaceSize(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,algo) 
-//                            |> int |> (workspace state).ResizeIf
-//
-//                        cudnn.SetStream (str state)
-//                        cudnn.ConvolutionBackwardData(
-//                            1.0f,filterDesc,extract_primal' filter,dstTensorDesc,
-//                            extract_adjoint' output,convDesc,1.0f,algo,workspace,srcTensorDesc,extract_adjoint' data)
-//
-//                (tape state).Push(convolution_backwards_data)
-//
-//        output, state
-//
-//    /// The convolutional function. Zeroes out the target primal during the call.
-//    let inline convolution_forward convPar (data : d4M) (filter : d4M) = 
-//        convolutional_forward' None (convPar,data,filter)
-//    
-//    let inline batch_normalization_forward 
-//            bnMode (bnScale : d4M) (bnBias : d4M) (bnRunningMean : d4M) 
-//            (bnRunningVariance : d4M) exponentialAverageFactor (input : d4M) (state: ^state) =
-//        let input_sizes = input.nchw
-//        let bias_sizes = bnBias.nchw
-//        let srcTensorDesc = (mem state).GetTensorDescriptor input_sizes
-//
-//        let bnDesc = 
-//            (mem state).GetBNDescriptor (input_sizes, bnMode, srcTensorDesc)
-//
-//        let _ =
-//            let mutable d,n,c,h,w,sn,sc,sh,sw = cudnnDataType.Double,0,0,0,0,0,0,0,0
-//            bnDesc.GetTensor4dDescriptor(&d,&n,&c,&h,&w,&sn,&sc,&sh,&sw)
-//            let bn_nchw = n,c,h,w
-//            if bn_nchw <> bnScale.nchw then failwith "Tensor dimensions for bnScale are incorrect."
-//            if bn_nchw <> bnBias.nchw then failwith "Tensor dimensions for bnBias are incorrect."
-//            if bn_nchw <> bnRunningMean.nchw then failwith "Tensor dimensions for bnRunningMean are incorrect."
-//            if bn_nchw <> bnRunningVariance.nchw then failwith "Tensor dimensions for bnRunningVariance are incorrect."
-//
-//        let alpha, beta = 1.0f, 0.0f
-//        let epsilon = 1e-5
-//        let bnSavedMean = (mem state).Getd4M(true,bias_sizes,(is_inference_only state),(str state))
-//        let bnSavedVariance = (mem state).Getd4M(true,bias_sizes,(is_inference_only state),(str state))
-//        let output = (mem state).Getd4M(false,input_sizes,(is_inference_only state),(str state))
-//
-//        if (is_inference_only state) then
-//            cudnn.SetStream (str state)
-//            cudnn.BatchNormalizationForwardTraining(
-//                bnMode, alpha, beta, srcTensorDesc, extract_primal' input, srcTensorDesc,
-//                extract_primal' output, bnDesc, extract_primal' bnScale, extract_primal' bnBias,
-//                exponentialAverageFactor, extract_primal' bnRunningMean, extract_primal' bnRunningVariance,
-//                epsilon, extract_primal' bnSavedMean, extract_primal' bnSavedVariance)
-//
-//            if hasAdjoint input then 
-//                let batch_normalization_backward () =
-//                    let dx_alpha, dx_beta = 1.0f, 1.0f
-//                    let param_alpha, param_beta = 1.0f, 1.0f
-//
-//                    deadness_check output input 
-//                    <| fun _ ->
-//                        cudnn.SetStream (str state)
-//                        cudnn.BatchNormalizationBackward(
-//                            bnMode, dx_alpha, dx_beta, param_alpha, param_beta, srcTensorDesc,
-//                            extract_primal' input, srcTensorDesc, extract_adjoint' output, srcTensorDesc,
-//                            extract_adjoint' input, bnDesc, extract_primal' bnScale, extract_adjoint' bnScale,
-//                            extract_adjoint' bnBias, epsilon, extract_primal' bnSavedMean, extract_primal' bnSavedVariance)
-//
-//                (tape state).Push batch_normalization_backward
-//        else
-//                cudnn.SetStream (str state)
-//                cudnn.BatchNormalizationForwardInference(
-//                    bnMode, alpha, beta, srcTensorDesc,extract_primal' input, srcTensorDesc,
-//                    extract_primal' output, bnDesc, extract_primal' bnScale, extract_primal' bnBias,
-//                    extract_primal' bnRunningMean, extract_primal' bnRunningVariance, epsilon)
-//        
-//        output, state
-//    
-//    let inline linear_layer_conv (convs: (ConvolutionParameters*d4M*d4M) []) (bias: d4M option) (state: ^state) =
-//        let folder prev_output input = 
-//            match prev_output with
-//            | Some (output, state) ->
-//                convolutional_forward' (Some output) input state |> Some
-//            | None ->
-//                convolutional_forward' None input state |> Some
-//    
-//        Array.fold folder None convs
-//        |>  function
-//            | Some(left, state) ->
-//                match bias with
-//                | None -> left, state
-//                | Some right -> tensor_add' true 1.0f left 1.0f right state
-//            | None -> failwith "linear_layer_conv has to have at least one input"
-//
-//
-//    let hadamaradMultiplicationModule = lazy new DeviceBinaryTransformModule("x*y;", "HadMult")
-//    let hadamaradMultiplicationErrorModule = lazy new DeviceTrinaryTransformModule("x*y+z;", "HadMultError")
-//    /// Hadamarad (elementwise) multiplication function.
-//    let inline private hadmult' (prev_output : ^a option) (a: ^a,b: ^a) (state: ^state) =
-//        let c = 
-//            match prev_output with
-//            | Some c -> 
-//                hadamaradMultiplicationErrorModule.Value.A((str state), P a, P b, P c, P c)
-//                c
-//            | None -> 
-//                getdMLike a (mem state) false (is_inference_only state) (str state)
-//                |> fun c -> 
-//                    hadamaradMultiplicationModule.Value.A((str state), P a, P b, P c)
-//                    c
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint a then 
-//                let hadmult_backward_left () = 
-//                    deadness_check c a 
-//                    <| fun _ ->
-//                        hadamaradMultiplicationErrorModule.Value.A((str state), P b, A c, A a, A a)
-//                (tape state).Push hadmult_backward_left
-//            if hasAdjoint b then 
-//                let hadmult_backward_right () = 
-//                    deadness_check c b 
-//                    <| fun _ ->
-//                        hadamaradMultiplicationErrorModule.Value.A((str state), P a, A c, A b, A b)
-//                (tape state).Push hadmult_backward_right
-//        c, state
-//
-//    let inline hadmult (a: ^a) (b: ^a) = hadmult' None (a, b)
-//    let inline linear_layer_hadmult (hads: (^a * ^a)[]) (state: ^state) = 
-//        hads 
-//        |> Array.fold (fun (prev_output,state) input ->
-//            hadmult' prev_output input state
-//            |> fun (input',state') -> (Some input',state')
-//            ) (None, state) 
-//        |>  function
-//            | None, _ -> failwith "linear_layer_hadmult requires at least one input"
-//            | Some v, state -> v, state
-//
-//    let squareModule = lazy new DeviceUnaryTransformModule("x*x;","Square")
-//    //y = error
-//    //z = previous adjoint value
-//    let squareErrorModule = lazy new DeviceTrinaryTransformModule("2.0f*x*y + z;","SquareError")
-//    let inline square (a:^a) (state: ^state) =
-//        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
-//
-//        squareModule.Value.A((str state), P a, P c)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint a then 
-//                let square_backward () = 
-//                    deadness_check c a 
-//                    <| fun _ -> 
-//                        squareErrorModule.Value.A((str state), P a, A c, A a, A a)
-//                (tape state).Push square_backward
-//        c, state
-//
-//    /// This one is for debugging currently
-//    let squareSumModule = lazy new DeviceUnaryMapSumModule("x*x;", "SquareSum")
-//
-//    let sumModule = lazy new DeviceUnaryMapSumModule("x;", "Sum")
-//    let sumErrorModule = lazy new DeviceUnaryCoefTransformModule("coef_x + x;", "SumError")
-//    let inline sum (a: ^a) (state: ^state) =
-//        let c = Df.create 0.0f
-//
-//        c.P := sumModule.Value.A((str state), P a)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint a then 
-//                let sum_backward () = 
-//                    if !c.A <> 0.0f then 
-//                        deadIs a Alive
-//                        sumErrorModule.Value.A((str state), !c.A, A a, A a)
-//                    else deadIs a Dead
-//                (tape state).Push sum_backward
-//        c, state
-//
-//    let inline scale (alpha: float32) (a:Df) (state: ^state) =
-//        let c = Df.create 0.0f
-//        c.P := lazy (alpha * a.P.Value.Value)
-//    
-//        if (is_inference_only state) = false then
-//            let scale_backward () = a.A := alpha * !c.A + !a.A
-//            (tape state).Push scale_backward
-//
-//        c, state
-//
-//    let inline sum_scalars (a:Df[]) (state: ^state) =
-//        let c = Df.create 0.0f
-//        c.P :=
-//            lazy 
-//                let mutable t = 0.0f
-//                for l in a do 
-//                    t <- t + l.P.Value.Value
-//                t
-//
-//        if (is_inference_only state) = false then
-//            let sum_scalars_backwards () = for l in a do l.A := !c.A + !l.A
-//            (tape state).Push sum_scalars_backwards
-//
-//        c, state
-//
-//    let logModule = lazy new DeviceUnaryTransformModule("logf(x);","Log")
-//    //y=error
-//    //z=previous adjoint
-//    let logErrorModule = lazy new DeviceTrinaryTransformModule("y / x + z;","LogError")
-//    let inline log_ (a:^a) (state: ^state) =
-//        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
-//
-//        logModule.Value.A((str state), P a, P c)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint a then
-//                let log_backward () = 
-//                    deadness_check c a 
-//                    <| fun _ -> 
-//                        logErrorModule.Value.A((str state), P a, A c, A a, A a)
-//                (tape state).Push log_backward
-//
-//        c, state
-//
-//    //coef_x = scalar
-//    //coef_y = coef
-//    let scalarMatrixAddModule = lazy new DeviceBinaryCoefTransformModule("coef_x + coef_y*x;","ScalarMatrixAdd")
-//    /// o <- scalar + coef*a
-//    let inline scalar_matrix_add scalar coef (a:^a) (state: ^state) =
-//        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
-//
-//        scalarMatrixAddModule.Value.A((str state), scalar, P a, coef, P a, P c)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint a then
-//                let scalar_matrix_add_backward () = 
-//                    deadness_check c a
-//                    <| fun _ -> 
-//                        saxpy (str state) coef (A' c) (A' a)
-//                (tape state).Push scalar_matrix_add_backward
-//        c, state
-//
-//    let inline add alpha (a: ^a) beta (b: ^a) (state: ^state) =
-//        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
-//
-//        geam (str state) nT nT alpha (P' a) beta (P' b) (P' c)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint a then
-//                let add_backward_left () = 
-//                    deadness_check c a
-//                    <| fun _ ->
-//                        saxpy (str state) alpha (A' c) (A' a)
-//                (tape state).Push add_backward_left
-//            if hasAdjoint b then
-//                let add_backward_right () = 
-//                    deadness_check c b
-//                    <| fun _ ->
-//                        saxpy (str state) beta (A' c) (A' b)
-//                (tape state).Push add_backward_right
-//        c, state
-//
-//    let inline softmax_instance_forward (data : ^a) (state: ^state) =
-//        let data_sizes = nchw data
-//
-//        let srcTensorDesc = (mem state).GetTensorDescriptor data_sizes
-//        let output = getdMLike data (mem state) false (is_inference_only state) (str state)
-//
-//        let algo = cudnnSoftmaxAlgorithm.Accurate // Log mode forgets to re-exponentiate at the end.
-//        let mode = cudnnSoftmaxMode.Instance
-//
-//        cudnn.SetStream (str state)
-//        cudnn.SoftmaxForward(algo, mode, 1.0f, srcTensorDesc, extract_primal' data, 0.0f, srcTensorDesc, extract_primal' output)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint data then
-//                let softmax_channel_backward () =
-//                    deadness_check output data
-//                    <| fun _ ->
-//                        cudnn.SetStream (str state)
-//                        cudnn.SoftmaxBackward(algo,mode,1.0f,srcTensorDesc,extract_primal' output,srcTensorDesc,extract_adjoint' output,1.0f,srcTensorDesc,extract_adjoint' data)
-//                (tape state).Push softmax_channel_backward
-//        output, state
-//
-//    let inline softmax x = softmax_instance_forward x
-//
-//    let clipModule = lazy new DeviceTrinaryCoefTransformModule("((x < coef_x) ? coef_x : (x > coef_y ? coef_y : x))+coef_z;","Clip")
-//    let clipErrorModule = lazy new DeviceTrinaryCoefTransformModule("y*((x < coef_x) ? 0.0f : (x > coef_y ? 0.0f : 1.0f))+z;","ClipError")
-//    /// o <- clip(min,max,a)+scalar
-//    /// The clip function. Can be used as Relu by setting max to positive infinity. 
-//    /// Can be used to make linear clipped sigmoid by setting min,max,scalar to -0.5f,0.5f,0.5f.
-//    let inline clip min max (a : ^a) scalar (state: ^state) =
-//        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
-//
-//        clipModule.Value.A((str state), min, P a, max, P a,scalar, P a, P c)
-//
-//        if (is_inference_only state) = false then
-//            if hasAdjoint a then
-//                let clip_backward () = 
-//                    deadness_check c a
-//                    <| fun _ -> 
-//                        clipErrorModule.Value.A((str state), min, P a, max, A c, max, A a, A a)
-//                (tape state).Push clip_backward
-//        c, state
-//
-//    let inline relu x (state: ^state) = 
-//        let t = (mem state).GetActivationDescriptor (cudnnActivationMode.Relu, defaultReluNanOption, 0.0)
-//        activation_forward t x state
-//    let inline sigmoid x (state: ^state) = 
-//        let t = (mem state).GetActivationDescriptor (cudnnActivationMode.Sigmoid, defaultReluNanOption, 0.0)
-//        activation_forward t x state
-//    let inline tanh_ x (state: ^state) = 
-//        let t = (mem state).GetActivationDescriptor (cudnnActivationMode.Tanh, defaultReluNanOption, 0.0)
-//        activation_forward t x state
-//    let inline clipped_sigmoid x (state: ^state) = 
-//        let x,state = sigmoid x state
-//        clip 0.0001f 0.9999f x 0.0f state
-//    let inline clipped_softmax x (state: ^state) = 
-//        let x,state = softmax x state
-//        clip 0.0001f 0.9999f x 0.0f state
-//
-//    /// Bind for the state monad.
-//    let inline (>>=) (a: ^s -> ^a * ^s) (f: ^a -> ^s -> ^b * ^s): ^s -> ^b * ^s =
-//        fun state ->
-//            let v',s' = a state
-//            f v' s'
-//
-//
-//    // TODO: In a future version of Spiral, make the two operations actually run in parallel by
-//    // passing in different streams and waiting on them using events. This would be a more controlable
-//    // that what I tried in V3 of the library where I did not observe any speedups from concurrency worth noting.
-//    /// Runs the operations in parallel and collects the results.
-//    let inline para2 f1 f2 (a0: ^a) (s: ^s) =
-//        let a1, s = f1 a0 s
-//        let a2, s = f2 a0 s
-//        (a1,a2),s
-//
-//    let inline squared_error_cost (target: ^a) (activations: ^a) =
-//        add 1.0f target -1.0f activations 
-//        >>= square
-//        >>= sum
-//        >>= scale (0.5f / float32 (cols target))
-//
-//    type StateBuilder() =
-//        member inline t.Return a = fun s -> (a,s)
-//        member inline t.Bind(a,f) = a >>= f
-//        member inline t.ReturnFrom x = x
-//
-//    let state = StateBuilder()
-//
-//    let inline cross_entropy_cost (target: ^a) (activations: ^a) = state {
-//        let lt = target
-//        let! ll = log_ activations
-//        let! rt = scalar_matrix_add 1.0f -1.0f target
-//        let! rl = scalar_matrix_add 1.0f -1.0f activations >>= log_
-//        return! linear_layer_hadmult [|lt, ll; rt, rl|] 
-//                >>= sum 
-//                >>= scale (-1.0f / float32 (cols target))
-//        }
-//
-//
-//    let maxColumnActivationModule = lazy new DeviceMaxColumnActivationModule()
-//    let accuracyModule = lazy new DeviceBinaryMapSumModule("(x*y == 0.0f) ? 0.0f : 1.0f;","Accuracy")
-//    /// Gets the accuracy using the workspace memory.
-//    // TODO: Using the workspace might be unsafe for this.
-//    let inline get_accuracy (targets: ^a) (activations : ^a) (state: ^state) =
-//        let a =
-//            lazy
-//                let o = convertdMLikeFromWorkspace targets (workspace state)
-//                maxColumnActivationModule.Value.A((str state), P activations, P o)
-//                accuracyModule.Value.A((str state), P targets, P o).Value
-//                |> round |> int
-//        a, state
-//
-//    /// Squared error cost that also returns the accuracy.
-//    let inline squared_error_cost' (targets: ^a) (activations : ^a) (state: ^state) =
-//        para2 (get_accuracy targets) (squared_error_cost targets) activations state
-//
-//    /// Cross entropy cost that also returns the accuracy.
-//    let inline cross_entropy_cost' (targets: ^a) (activations : ^a) (state: ^state) =
-//        para2 (get_accuracy targets) (cross_entropy_cost targets) activations state
-//
-//    let find_max_index (action_values : float32[]) =
-//        let mutable max = Single.NegativeInfinity
-//        let mutable index = -1
-//        for i=0 to action_values.Length-1 do
-//            let x = action_values.[i]
-//            if max < x then max <- x; index <- i
-//        index
-//
-//    /// As it says on the tin. TODO: Make initializers for other activation functions.
-//    let inline reluInitializer (state: ^state) (a: ^a)  =
-//        let scale = (1.0f / sqrt(addDims a |> float32))
-//        fillRandomUniformMatrix((str state),a,scale,0.0f)
-//        a
-//
-//    let inline sgd learning_rate (node : ^a) (state: ^state) = 
-//        saxpy (str state) -learning_rate (A' node) (P' node)
-//        extract_adjoint' node |> fun x -> x.MemsetAsync(0u,(str state).Stream)
-//
-//    let inline clipped_sgd clipping_threshold learning_rate (node : ^a) (state: ^state) = 
-//        gradclipModule.Value.A((str state), clipping_threshold, A node,A node)
-//        saxpy (str state) -learning_rate (A' node) (P' node)
-//        extract_adjoint' node |> fun x -> x.MemsetAsync(0u,(str state).Stream)
-//
-//    let inline disposeLayer x =
-//        (^a: (member ToArray: ^b[]) x)
-//        |> Array.iter dispose
-//
-//
-//    type FFRec<'state when 'state: (member Tape: Stack<unit -> unit>)
-//                       and 'state: (member Mem: ObjectPool)
-//                       and 'state: (member Str: CudaStream)
-//                       and 'state: (member Workspace: Workspace)
-//                       and 'state: (member IsInferenceOnly: bool)> =
-//        {
-//        W: d2M
-//        b: d2M
-//        a: d2M -> 'state -> d2M * 'state
-//        }
-//
-//        member inline t.Run(x: d2M) = linear_layer_matmult [|t.W,x|] (Some t.b) >>= t.a
-//        member inline l.ToArray = [|l.W;l.b|]
-//        member inline t.Update (update_function : d2M -> ^state -> unit, state: ^state) =
-//            t.ToArray |> Array.iter (fun x -> update_function x state)
-//
-//        static member inline createReluRandomLayer desired_hidden_size (input: d2M) (state: ^state) =
-//            {
-//             W = d2M.create(desired_hidden_size,input.Rows) |> reluInitializer state
-//             b = d2M.create(desired_hidden_size,1) |> reluInitializer state
-//             a = relu
-//            } 
-//
-//        static member inline createSigmoidRandomLayer desired_hidden_size (input: d2M) (state: ^state) =
-//            FFRec.createReluRandomLayer desired_hidden_size input state // TODO: Make sigmoid initializer later.
-//            |> fun x -> {x with a = sigmoid}
-//
-//        static member inline createClippedSigmoidRandomLayer desired_hidden_size (input: d2M) (state: ^state) =
-//            FFRec.createReluRandomLayer desired_hidden_size input state // TODO: Make sigmoid initializer later.
-//            |> fun x -> {x with a = clipped_sigmoid}
-//
-//    type LayerType<'a, 'state, 'layer_type> =
-//        | Uninitialized of desired_hidden_size: int * create_layer: (int -> 'a -> ^state -> 'layer_type)
-//        | Initialized of node: 'layer_type
-//
-//        member t.Value =
-//            match t with
-//            | Initialized v -> v
-//            | _ -> failwith "Node is uninitialized."
-//
-//    // The actual layers are higher order classes. Now this is genuinely new to V4 of Spiral.
-//    // I could not have done this without statically resolved type parameters.
-//    // I never expected I would get so much mileage out of them.
-//    type Layer<'a, 'state, 'b,
-//                'layer_type when 'layer_type: (member Run: 'a -> ('state -> 'b * 'state)) 
-//                             and 'layer_type: (member ToArray: 'a[]) 
-//                             and ^layer_type: (member Update: ('a -> 'state -> unit) * 'state -> unit)> =
-//        {
-//        mutable node: LayerType<'a, 'state, 'layer_type>
-//        }
-//
-//        member inline t.RunLayer (input: ^a) = fun (state: ^state) ->
-//            let inline run v x =
-//                (^layer_type: (member Run: ^a -> (^state -> ^b * ^state)) v, x)
-//            match t.node with
-//            | Initialized v ->
-//                run v input state
-//            | Uninitialized(desired_hidden_size,create_layer) ->
-//                let v = create_layer desired_hidden_size input state
-//                t.node <- Initialized v
-//                run v input state
-//
-//        member inline t.ToArray =
-//            let inline toArray v =
-//                (^layer_type: (member ToArray: ^a[]) v)
-//            toArray t.node.Value
-//
-//        member inline t.UpdateLayer (update_function : ^a -> ^state -> unit, state: ^state) =
-//            (^layer_type: (member Update: (^a -> ^state -> unit) * ^state -> unit) t.node.Value, update_function, state)
-//
-//        static member inline create(desired_hidden_size: int, create_layer: int -> 'a -> ^state -> 'layer_type) =
-//            {node = Uninitialized(desired_hidden_size,create_layer)}
-//
-//    let inline FFReluLayer hidden_size = Layer.create(hidden_size,FFRec.createReluRandomLayer)
-//    let inline FFSigmoidLayer hidden_size = Layer.create(hidden_size,FFRec.createSigmoidRandomLayer)
-//    let inline FFClippedSigmoidLayer hidden_size = Layer.create(hidden_size,FFRec.createClippedSigmoidRandomLayer)
-//
-//    let inline runLayer layer input =
-//        (^layer_type: (member RunLayer: ^b -> (^state -> ^b * ^state)) layer, input)
-//
-//    let inline updateLayer update_function state layer =
-//        (^layer_type: (member UpdateLayer: (^a -> ^state -> unit) * ^state -> unit) layer, update_function, state)
-//
-//    let inline (>=>) a b = fun x -> a x >>= b
-//
-//    // For wavefront iteration.
-//    // From https://docs.microsoft.com/en-us/dotnet/articles/fsharp/language-reference/computation-expressions
-//    /// Computations that can be run step by step.
-//    type Eventually<'T> =
-//        | Done of 'T
-//        | NotYetDone of (unit -> Eventually<'T>)
-//
-//        static member doBind (expr: Eventually<'a>) (func: 'a -> Eventually<'b>) =
-//            match expr with
-//            | Done value -> NotYetDone (fun () -> func value)
-//            | NotYetDone work -> NotYetDone (fun () -> Eventually<_>.doBind (work()) func)
-//
-//        static member doReturn expr = Done expr
-//
-//        // The stepping action for the computations.
-//        static member step expr =
-//            match expr with
-//            | Done _ -> expr
-//            | NotYetDone func -> func ()
-//
-//    /// Generic function for training and inference.
-//    let inline private run 
-//            (cost: ^a -> ^a -> ^state -> ^m) 
-//            (extractor: ^m -> (Lazy<int> * Df) * ^state)
-//            (update: ^state -> unit)
-//            (set : (^a * ^a)[]) (state: ^state) =
-//        let mutable accumulated_cost = 0.0f
-//        let mutable accuracy = 0
-//        for target,input in set do
-//            (mem state).Reset()
-//            let (hits,r),_ = cost target input state |> extractor
-//            accumulated_cost <- accumulated_cost + r.P.Value.Value
-//
-//            if is_inference_only state = true then
-//                if (tape state).Count > 0 then
-//                    failwith "Forgot to use the is_inference_only flag in a library function somewhere"
-//                accuracy <- accuracy + hits.Value
-//            else
-//                r.A := 1.0f
-//                let tape = tape state
-//                while tape.Count > 0 do
-//                    tape.Pop()()
-//                update state
-//            
-//        accuracy, accumulated_cost / float32 set.Length
-//    
-//    /// Trains the network in the depth direction.
-//    let inline train cost update set state = run cost id update set (with_is_inference_only state false) |> snd
-//    /// Runs the network without doing backprop.
-//    let inline infer cost set state = run cost id (fun _ -> ()) set (with_is_inference_only state true)
-//    /// Generic extractor used by train' and infer' functions.
-//    let rec extract_eventually =
-//        function
-//        | Done x -> x
-//        | NotYetDone x -> x() |> extract_eventually
-//    /// Trains the delayed network in the depth direction.
-//    let inline train' cost update set state = run cost extract_eventually update set (with_is_inference_only state false) |> snd
-//    /// Runs the delayed network without doing backprop.
-//    let inline infer' cost set state = run cost extract_eventually (fun _ -> ()) set (with_is_inference_only state true)
+    let inline deadness_check c a (f : unit -> unit) =
+        match isDead c with
+        | Undefined -> failwith "The upper node should not be undefined."
+        | Dead -> // If the upper node is dead no backpropagation is done.
+            match isDead a with
+            | Undefined -> deadIs a Dead
+            | Dead | Alive -> () // If the bottom node is Alive do not modify it to be Dead as there exists a path from elsewhere through it.
+        | Alive -> 
+            deadIs a Alive
+            f()
+
+    type StanState(?is_inference_only) =
+        member val Workspace = new Workspace()
+        member val Str = new CudaStream()
+        member val Mem = new ObjectPool()
+        member val Tape = Stack()
+        member val IsInferenceOnly = defaultArg is_inference_only false with get, set
+
+        member t.Dispose() =
+            t.Workspace.Dispose()
+            t.Str.Dispose()
+            t.Mem.Dispose()
+            t.Tape.Clear()
+
+        interface IDisposable with
+            member t.Dispose() = t.Dispose()
+
+    let inline with_is_inference_only (x: ^a) v =
+        (^a: (member set_IsInferenceOnly: bool -> unit) x, v)
+
+    let inline tape (x: ^a) =
+        (^a: (member Tape: Stack<unit -> unit>) x)
+
+    let inline mem (x: ^a) =
+        (^a: (member Mem: ObjectPool) x)
+
+    let inline str (x: ^a) =
+        (^a: (member Str: CudaStream) x)
+
+    let inline workspace (x: ^a) =
+        (^a: (member Workspace: Workspace) x)
+
+    let inline is_inference_only (x: ^a) =
+        (^a: (member IsInferenceOnly: bool) x)
+
+    /// Gets a dM the same size as the first one from the object pool.
+    let inline getdMLike (x: ^a) (p: ObjectPool) is_constant is_inference_only str = // TODO: Like copy, refactor this one too.
+        (^a: (member GetFromObjectPool: ObjectPool * bool * bool * CudaStream -> ^a) x, p, is_constant, is_inference_only, str)
+
+    /// Gets a dM the same size as the first one from the object pool. The same as the first version except it has less boilerplate.
+    let inline getdMLike' (x: ^a) is_constant state =
+        (^a: (member GetFromObjectPool: ObjectPool * bool * bool * CudaStream -> ^a) x, mem state, is_constant, is_inference_only state, str state)
+
+    /// Copies the dM type using the object pool.
+    let inline copy (x: ^a) is_constant state =
+        (^a: (member CopyUsingObjectPool: ObjectPool * bool * bool * CudaStream -> ^a) x, mem state, is_constant, is_inference_only state, str state)
+
+    ///// Matrix-matrix multiply.
+    let inline private matmult' (prev_output : d2M option) (a:d2M, b:d2M) (state: #StanState) = 
+        // Note: This function is generic enough that a,b can be anything.
+        // If that is necessary, the type annotation can be removed.
+        let c = 
+            match prev_output with
+            | None ->
+                let num_rows = rows a
+                let num_cols = cols b
+                (mem state).Getd2M(false,(num_rows,num_cols),(is_inference_only state),(str state))
+                |> fun c ->
+                    gemm (str state) nT nT 1.0f (P' a) (P' b) 0.0f (P' c)
+                    c
+            | Some c ->
+                gemm (str state) nT nT 1.0f (P' a) (P' b) 1.0f (P' c)
+                c
+    
+        if (is_inference_only state) = false then
+            if hasAdjoint a then 
+                let matmult_backward_left () = 
+                    deadness_check c a <| fun _ -> 
+                        gemm (str state) nT T 1.0f (A' c) (P' b) 1.0f (A' a)
+                (tape state).Push(matmult_backward_left)
+
+            if hasAdjoint b then 
+                let matmult_backward_right () = 
+                    deadness_check c b <| fun _ -> 
+                        gemm (str state) T nT 1.0f (P' a) (A' c) 1.0f (A' b)
+                (tape state).Push(matmult_backward_right)
+        c, state
+
+    let inline matmult a b = matmult' None (a, b)
+
+    let inline tensor_add' add_to_left alpha (left : ^a) beta (right : ^a) (state: #StanState) =
+        let left_nchw = nchw left
+        let right_nchw = nchw right
+        let leftDesc = (mem state).GetTensorDescriptor left_nchw
+        let rightDesc = (mem state).GetTensorDescriptor right_nchw
+
+        let output = 
+            if add_to_left = false then
+                getdMLike left (mem state) false (is_inference_only state) (str state)
+                |> fun output ->
+                    geam (str state) nT nT 1.0f (P' left) 0.0f (P' output) (P' output)
+                    output
+            else 
+                left
+
+        if left_nchw <> right_nchw then
+            cudnn.SetStream (str state)
+            cudnn.AddTensor(beta,rightDesc,extract_primal' right, alpha,leftDesc,extract_primal' output) // Add right to output.
+        else 
+            geam (str state) nT nT beta (P' right) alpha (P' output) (P' output)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint right then 
+                let tensor_add_right_backwards () =
+                    deadness_check output right
+                    <| fun _ ->
+                        if left_nchw = right_nchw then
+                            saxpy (str state) beta (A' output) (A' right)
+                        else
+                            cudnn.SetStream (str state)
+                            let left_nchw = nchwBiasAdd left // Ugly hack to get cuDNN to work with 2D matrices.
+                            let right_nchw = nchwBiasAdd right
+                            let leftDesc = (mem state).GetTensorDescriptor left_nchw
+                            let rightDesc = (mem state).GetTensorDescriptor right_nchw
+                            cudnn.ConvolutionBackwardBias(beta,leftDesc,extract_adjoint' output,1.0f,rightDesc,extract_adjoint' right)
+
+                (tape state).Push(tensor_add_right_backwards)
+
+            if add_to_left = false && hasAdjoint left then // No point in adding the adjoint to itself.
+                let tensor_add_left_backwards () = 
+                    deadness_check output left 
+                    <| fun _ -> 
+                        saxpy (str state) alpha (A' output) (A' left)
+                (tape state).Push(tensor_add_left_backwards)
+        output, state
+
+    let inline linear_layer_matmult (mm: (d2M*d2M) []) (bias: d2M option) (state: #StanState) =
+        mm
+        |> Array.fold (fun (prev_output,state) input -> 
+            matmult' prev_output input state
+            |> fun (input',state') -> (Some input',state')
+            ) (None,state)
+        |>  function
+            | None, _ -> failwith "There must be one input in mm"
+            | Some left, state ->
+                match bias with
+                | None -> left, state
+                | Some right -> tensor_add' true 1.0f left 1.0f right state
+
+    /// The activation function. Zeroes out the target primal during the call.
+    let inline activation_forward mode (input : ^a) (state: #StanState) =
+        let input_sizes = nchw input
+        let srcTensorDesc = (mem state).GetTensorDescriptor input_sizes
+
+        let output = getdMLike input (mem state) false (is_inference_only state) (str state)
+
+        cudnn.SetStream (str state)
+        cudnn.ActivationForward(mode,1.0f,srcTensorDesc,extract_primal' input,0.0f,srcTensorDesc,extract_primal' output)
+        if (is_inference_only state) = false then
+            if hasAdjoint input then 
+                let activation_backward () =
+                    deadness_check output input 
+                    <| fun _ -> 
+                        cudnn.SetStream (str state)
+                        cudnn.ActivationBackward(mode,1.0f,srcTensorDesc,extract_primal' output,srcTensorDesc,extract_adjoint' output,srcTensorDesc,extract_primal' input,1.0f,srcTensorDesc,extract_adjoint' input)
+                (tape state).Push(activation_backward)
+        output, state
+
+    /// The pooling function. Zeroes out the target primal during the call.
+    let inline pooling_forward p (input : d4M) (state: #StanState) =
+        let poolingDescriptor = (mem state).GetPoolingDescriptor p
+        let input_sizes = nchw input
+        let srcTensorDesc = (mem state).GetTensorDescriptor input_sizes
+        let dest_sizes = poolingDescriptor.GetPooling2dForwardOutputDim srcTensorDesc
+
+        let output = (mem state).Getd4M(false,nchw input,(is_inference_only state),(str state))
+
+        let dstTensorDesc = (mem state).GetTensorDescriptor dest_sizes
+
+        cudnn.SetStream (str state)
+        cudnn.PoolingForward(poolingDescriptor,1.0f,srcTensorDesc,extract_primal' input,0.0f,dstTensorDesc,extract_primal' output)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint input then 
+                let pooling_backward () =
+                    deadness_check output input 
+                    <| fun _ ->
+                        cudnn.SetStream (str state)
+                        cudnn.PoolingBackward(poolingDescriptor,1.0f,srcTensorDesc,extract_primal' output, srcTensorDesc,
+                                              extract_adjoint' output,dstTensorDesc,extract_primal' input,1.0f,dstTensorDesc,extract_adjoint' input)
+                (tape state).Push(pooling_backward)
+        output, state
+
+
+    let inline private convolutional_forward' (prev_output: d4M option) (convPar, data : d4M, filter : d4M) (state: #StanState) =
+        let data_sizes = data.nchw
+        let filter_sizes = filter.nchw
+
+        let srcTensorDesc = (mem state).GetTensorDescriptor data_sizes
+    
+        let filterDesc = (mem state).GetFilterDescriptor filter_sizes
+        let convDesc = (mem state).GetConvolutionDescriptor convPar
+
+        let dims, output = 
+            let dims = convDesc.GetConvolution2dForwardOutputDim(srcTensorDesc,filterDesc)
+            match prev_output with
+            | Some prev_output ->
+                let prev_dims = prev_output.nchw
+                if dims <> prev_dims then failwith "dims <> prev_dims in linear_layer_conv"
+                prev_dims, prev_output
+            | None ->
+                dims, (mem state).Getd4M(false,dims,(is_inference_only state),(str state))
+
+        let dstTensorDesc = (mem state).GetTensorDescriptor dims
+
+        let algo = 
+            cudnn.GetConvolutionForwardAlgorithm(
+                srcTensorDesc,filterDesc,convDesc,dstTensorDesc,
+                cudnnConvolutionFwdPreference.PreferFastest,SizeT 0)
+        let _ = 
+            let workspace = 
+                cudnn.GetConvolutionForwardWorkspaceSize(srcTensorDesc, filterDesc, convDesc, dstTensorDesc, algo) 
+                |> int |> (workspace state).ResizeIf
+
+            let beta = 
+                match prev_output with
+                | None -> 0.0f
+                | Some _ -> 1.0f
+
+            cudnn.SetStream (str state)
+            cudnn.ConvolutionForward(1.0f,srcTensorDesc,extract_primal' data,filterDesc,extract_primal' filter,convDesc,algo,workspace,beta,dstTensorDesc,extract_primal' output) // Don't zero out the previous output.
+
+        if (is_inference_only state) = false then
+            if hasAdjoint filter then 
+                let convolution_backwards_filter () =
+                    deadness_check output filter 
+                    <| fun _ ->
+                        let algo = 
+                            cudnn.GetConvolutionBackwardFilterAlgorithm(
+                                srcTensorDesc,dstTensorDesc,convDesc,filterDesc,
+                                cudnnConvolutionBwdFilterPreference.PreferFastest,SizeT 0)
+
+                        let workspace =
+                            cudnn.GetConvolutionBackwardFilterWorkspaceSize(srcTensorDesc,dstTensorDesc,convDesc,filterDesc,algo) 
+                            |> int |> (workspace state).ResizeIf
+
+                        cudnn.SetStream (str state)
+                        cudnn.ConvolutionBackwardFilter(
+                            1.0f,srcTensorDesc,extract_primal' data,dstTensorDesc,extract_adjoint' output,
+                            convDesc,algo,workspace,1.0f,filterDesc,extract_adjoint' filter)
+
+                (tape state).Push(convolution_backwards_filter)
+
+            if hasAdjoint data then 
+                let convolution_backwards_data () =
+                    deadness_check output data 
+                    <| fun _ ->
+                        let algo = 
+                            cudnn.GetConvolutionBackwardDataAlgorithm(
+                                filterDesc,dstTensorDesc,convDesc,srcTensorDesc,
+                                cudnnConvolutionBwdDataPreference.PreferFastest,SizeT 0)
+
+                        let workspace = 
+                            cudnn.GetConvolutionBackwardDataWorkspaceSize(filterDesc,dstTensorDesc,convDesc,srcTensorDesc,algo) 
+                            |> int |> (workspace state).ResizeIf
+
+                        cudnn.SetStream (str state)
+                        cudnn.ConvolutionBackwardData(
+                            1.0f,filterDesc,extract_primal' filter,dstTensorDesc,
+                            extract_adjoint' output,convDesc,1.0f,algo,workspace,srcTensorDesc,extract_adjoint' data)
+
+                (tape state).Push(convolution_backwards_data)
+
+        output, state
+
+    /// The convolutional function. Zeroes out the target primal during the call.
+    let inline convolution_forward convPar (data : d4M) (filter : d4M) = 
+        convolutional_forward' None (convPar,data,filter)
+    
+    let inline batch_normalization_forward 
+            bnMode (bnScale : ^a) (bnBias : ^a) (bnRunningMean : ^a) 
+            (bnRunningVariance : ^a) exponentialAverageFactor (input : ^a) (state: #StanState) =
+        let input_sizes = nchw input
+        let bias_sizes = nchw bnBias
+        let srcTensorDesc = (mem state).GetTensorDescriptor input_sizes
+
+        let bnDesc = 
+            (mem state).GetBNDescriptor (input_sizes, bnMode, srcTensorDesc)
+
+        let _ =
+            let mutable d,n,c,h,w,sn,sc,sh,sw = cudnnDataType.Double,0,0,0,0,0,0,0,0
+            bnDesc.GetTensor4dDescriptor(&d,&n,&c,&h,&w,&sn,&sc,&sh,&sw)
+            let bn_nchw = n,c,h,w
+            if bn_nchw <> nchw bnScale then failwith "Tensor dimensions for bnScale are incorrect."
+            if bn_nchw <> nchw bnBias then failwith "Tensor dimensions for bnBias are incorrect."
+            if bn_nchw <> nchw bnRunningMean then failwith "Tensor dimensions for bnRunningMean are incorrect."
+            if bn_nchw <> nchw bnRunningVariance then failwith "Tensor dimensions for bnRunningVariance are incorrect."
+
+        let alpha, beta = 1.0f, 0.0f
+        let epsilon = 1e-5
+        let bnSavedMean = (mem state).Getd4M(true,bias_sizes,(is_inference_only state),(str state))
+        let bnSavedVariance = (mem state).Getd4M(true,bias_sizes,(is_inference_only state),(str state))
+        let output = (mem state).Getd4M(false,input_sizes,(is_inference_only state),(str state))
+
+        if (is_inference_only state) then
+            cudnn.SetStream (str state)
+            cudnn.BatchNormalizationForwardTraining(
+                bnMode, alpha, beta, srcTensorDesc, extract_primal' input, srcTensorDesc,
+                extract_primal' output, bnDesc, extract_primal' bnScale, extract_primal' bnBias,
+                exponentialAverageFactor, extract_primal' bnRunningMean, extract_primal' bnRunningVariance,
+                epsilon, extract_primal' bnSavedMean, extract_primal' bnSavedVariance)
+
+            if hasAdjoint input then 
+                let batch_normalization_backward () =
+                    let dx_alpha, dx_beta = 1.0f, 1.0f
+                    let param_alpha, param_beta = 1.0f, 1.0f
+
+                    deadness_check output input 
+                    <| fun _ ->
+                        cudnn.SetStream (str state)
+                        cudnn.BatchNormalizationBackward(
+                            bnMode, dx_alpha, dx_beta, param_alpha, param_beta, srcTensorDesc,
+                            extract_primal' input, srcTensorDesc, extract_adjoint' output, srcTensorDesc,
+                            extract_adjoint' input, bnDesc, extract_primal' bnScale, extract_adjoint' bnScale,
+                            extract_adjoint' bnBias, epsilon, extract_primal' bnSavedMean, extract_primal' bnSavedVariance)
+
+                (tape state).Push batch_normalization_backward
+        else
+                cudnn.SetStream (str state)
+                cudnn.BatchNormalizationForwardInference(
+                    bnMode, alpha, beta, srcTensorDesc,extract_primal' input, srcTensorDesc,
+                    extract_primal' output, bnDesc, extract_primal' bnScale, extract_primal' bnBias,
+                    extract_primal' bnRunningMean, extract_primal' bnRunningVariance, epsilon)
+        
+        output, state
+    
+    let inline linear_layer_conv (convs: (ConvolutionParameters*d4M*d4M) []) (bias: d4M option) (state: #StanState) =
+        let folder prev_output input = 
+            match prev_output with
+            | Some (output, state) ->
+                convolutional_forward' (Some output) input state |> Some
+            | None ->
+                convolutional_forward' None input state |> Some
+    
+        Array.fold folder None convs
+        |>  function
+            | Some(left, state) ->
+                match bias with
+                | None -> left, state
+                | Some right -> tensor_add' true 1.0f left 1.0f right state
+            | None -> failwith "linear_layer_conv has to have at least one input"
+
+
+    let hadamaradMultiplicationModule = lazy new DeviceBinaryTransformModule("x*y;", "HadMult")
+    let hadamaradMultiplicationErrorModule = lazy new DeviceTrinaryTransformModule("x*y+z;", "HadMultError")
+    /// Hadamarad (elementwise) multiplication function.
+    let inline private hadmult' (prev_output : ^a option) (a: ^a,b: ^a) (state: #StanState) =
+        let c = 
+            match prev_output with
+            | Some c -> 
+                hadamaradMultiplicationErrorModule.Value.A((str state), P a, P b, P c, P c)
+                c
+            | None -> 
+                getdMLike a (mem state) false (is_inference_only state) (str state)
+                |> fun c -> 
+                    hadamaradMultiplicationModule.Value.A((str state), P a, P b, P c)
+                    c
+
+        if (is_inference_only state) = false then
+            if hasAdjoint a then 
+                let hadmult_backward_left () = 
+                    deadness_check c a 
+                    <| fun _ ->
+                        hadamaradMultiplicationErrorModule.Value.A((str state), P b, A c, A a, A a)
+                (tape state).Push hadmult_backward_left
+            if hasAdjoint b then 
+                let hadmult_backward_right () = 
+                    deadness_check c b 
+                    <| fun _ ->
+                        hadamaradMultiplicationErrorModule.Value.A((str state), P a, A c, A b, A b)
+                (tape state).Push hadmult_backward_right
+        c, state
+
+    let inline hadmult (a: ^a) (b: ^a) = hadmult' None (a, b)
+    let inline linear_layer_hadmult (hads: (^a * ^a)[]) (state: #StanState) = 
+        hads 
+        |> Array.fold (fun (prev_output,state) input ->
+            hadmult' prev_output input state
+            |> fun (input',state') -> (Some input',state')
+            ) (None, state) 
+        |>  function
+            | None, _ -> failwith "linear_layer_hadmult requires at least one input"
+            | Some v, state -> v, state
+
+    let squareModule = lazy new DeviceUnaryTransformModule("x*x;","Square")
+    //y = error
+    //z = previous adjoint value
+    let squareErrorModule = lazy new DeviceTrinaryTransformModule("2.0f*x*y + z;","SquareError")
+    let inline square (a:^a) (state: #StanState) =
+        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
+
+        squareModule.Value.A((str state), P a, P c)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint a then 
+                let square_backward () = 
+                    deadness_check c a 
+                    <| fun _ -> 
+                        squareErrorModule.Value.A((str state), P a, A c, A a, A a)
+                (tape state).Push square_backward
+        c, state
+
+    /// This one is for debugging currently
+    let squareSumModule = lazy new DeviceUnaryMapSumModule("x*x;", "SquareSum")
+
+    let sumModule = lazy new DeviceUnaryMapSumModule("x;", "Sum")
+    let sumErrorModule = lazy new DeviceUnaryCoefTransformModule("coef_x + x;", "SumError")
+    let inline sum (a: ^a) (state: #StanState) =
+        let c = Df.create 0.0f
+
+        c.P := sumModule.Value.A((str state), P a)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint a then 
+                let sum_backward () = 
+                    if !c.A <> 0.0f then 
+                        deadIs a Alive
+                        sumErrorModule.Value.A((str state), !c.A, A a, A a)
+                    else deadIs a Dead
+                (tape state).Push sum_backward
+        c, state
+
+    let inline scale (alpha: float32) (a:Df) (state: #StanState) =
+        let c = Df.create 0.0f
+        c.P := lazy (alpha * a.P.Value.Value)
+    
+        if (is_inference_only state) = false then
+            let scale_backward () = a.A := alpha * !c.A + !a.A
+            (tape state).Push scale_backward
+
+        c, state
+
+    let inline sum_scalars (a:Df[]) (state: #StanState) =
+        let c = Df.create 0.0f
+        c.P :=
+            lazy 
+                let mutable t = 0.0f
+                for l in a do 
+                    t <- t + l.P.Value.Value
+                t
+
+        if (is_inference_only state) = false then
+            let sum_scalars_backwards () = for l in a do l.A := !c.A + !l.A
+            (tape state).Push sum_scalars_backwards
+
+        c, state
+
+    let logModule = lazy new DeviceUnaryTransformModule("logf(x);","Log")
+    //y=error
+    //z=previous adjoint
+    let logErrorModule = lazy new DeviceTrinaryTransformModule("y / x + z;","LogError")
+    let inline log_ (a:^a) (state: #StanState) =
+        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
+
+        logModule.Value.A((str state), P a, P c)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint a then
+                let log_backward () = 
+                    deadness_check c a 
+                    <| fun _ -> 
+                        logErrorModule.Value.A((str state), P a, A c, A a, A a)
+                (tape state).Push log_backward
+
+        c, state
+
+    //coef_x = scalar
+    //coef_y = coef
+    let scalarMatrixAddModule = lazy new DeviceBinaryCoefTransformModule("coef_x + coef_y*x;","ScalarMatrixAdd")
+    /// o <- scalar + coef*a
+    let inline scalar_matrix_add scalar coef (a:^a) (state: #StanState) =
+        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
+
+        scalarMatrixAddModule.Value.A((str state), scalar, P a, coef, P a, P c)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint a then
+                let scalar_matrix_add_backward () = 
+                    deadness_check c a
+                    <| fun _ -> 
+                        saxpy (str state) coef (A' c) (A' a)
+                (tape state).Push scalar_matrix_add_backward
+        c, state
+
+    let inline add alpha (a: ^a) beta (b: ^a) (state: #StanState) =
+        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
+
+        geam (str state) nT nT alpha (P' a) beta (P' b) (P' c)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint a then
+                let add_backward_left () = 
+                    deadness_check c a
+                    <| fun _ ->
+                        saxpy (str state) alpha (A' c) (A' a)
+                (tape state).Push add_backward_left
+            if hasAdjoint b then
+                let add_backward_right () = 
+                    deadness_check c b
+                    <| fun _ ->
+                        saxpy (str state) beta (A' c) (A' b)
+                (tape state).Push add_backward_right
+        c, state
+
+    let inline softmax_instance_forward (data : ^a) (state: #StanState) =
+        let data_sizes = nchw data
+
+        let srcTensorDesc = (mem state).GetTensorDescriptor data_sizes
+        let output = getdMLike data (mem state) false (is_inference_only state) (str state)
+
+        let algo = cudnnSoftmaxAlgorithm.Accurate // Log mode forgets to re-exponentiate at the end.
+        let mode = cudnnSoftmaxMode.Instance
+
+        cudnn.SetStream (str state)
+        cudnn.SoftmaxForward(algo, mode, 1.0f, srcTensorDesc, extract_primal' data, 0.0f, srcTensorDesc, extract_primal' output)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint data then
+                let softmax_channel_backward () =
+                    deadness_check output data
+                    <| fun _ ->
+                        cudnn.SetStream (str state)
+                        cudnn.SoftmaxBackward(algo,mode,1.0f,srcTensorDesc,extract_primal' output,srcTensorDesc,extract_adjoint' output,1.0f,srcTensorDesc,extract_adjoint' data)
+                (tape state).Push softmax_channel_backward
+        output, state
+
+    let inline softmax x = softmax_instance_forward x
+
+    let clipModule = lazy new DeviceTrinaryCoefTransformModule("((x < coef_x) ? coef_x : (x > coef_y ? coef_y : x))+coef_z;","Clip")
+    let clipErrorModule = lazy new DeviceTrinaryCoefTransformModule("y*((x < coef_x) ? 0.0f : (x > coef_y ? 0.0f : 1.0f))+z;","ClipError")
+    /// o <- clip(min,max,a)+scalar
+    /// The clip function. Can be used as Relu by setting max to positive infinity. 
+    /// Can be used to make linear clipped sigmoid by setting min,max,scalar to -0.5f,0.5f,0.5f.
+    let inline clip min max (a : ^a) scalar (state: #StanState) =
+        let c = getdMLike a (mem state) false (is_inference_only state) (str state)
+
+        clipModule.Value.A((str state), min, P a, max, P a,scalar, P a, P c)
+
+        if (is_inference_only state) = false then
+            if hasAdjoint a then
+                let clip_backward () = 
+                    deadness_check c a
+                    <| fun _ -> 
+                        clipErrorModule.Value.A((str state), min, P a, max, A c, max, A a, A a)
+                (tape state).Push clip_backward
+        c, state
+
+    let inline relu x (state: #StanState) = 
+        let t = (mem state).GetActivationDescriptor (cudnnActivationMode.Relu, defaultReluNanOption, 0.0)
+        activation_forward t x state
+    let inline sigmoid x (state: #StanState) = 
+        let t = (mem state).GetActivationDescriptor (cudnnActivationMode.Sigmoid, defaultReluNanOption, 0.0)
+        activation_forward t x state
+    let inline tanh_ x (state: #StanState) = 
+        let t = (mem state).GetActivationDescriptor (cudnnActivationMode.Tanh, defaultReluNanOption, 0.0)
+        activation_forward t x state
+    let inline clipped_sigmoid x (state: #StanState) = 
+        let x,state = sigmoid x state
+        clip 0.0001f 0.9999f x 0.0f state
+    let inline clipped_softmax x (state: #StanState) = 
+        let x,state = softmax x state
+        clip 0.0001f 0.9999f x 0.0f state
+
+    /// Bind for the state passing functions
+    let inline (>>=) (a: ^s -> ^a * ^s) (f: ^a -> ^s -> ^b * ^s): ^s -> ^b * ^s =
+        fun state -> let v',s' = a state in f v' s'
+
+    // TODO: In a future version of Spiral, make the two operations actually run in parallel by
+    // passing in different streams and waiting on them using events. This would be a more controlable
+    // that what I tried in V3 of the library where I did not observe any speedups from concurrency worth noting.
+    /// Runs the operations in parallel and collects the results.
+    let inline para2 f1 f2 (a0: ^a) (s: ^s) =
+        let a1, s = f1 a0 s
+        let a2, s = f2 a0 s
+        (a1,a2),s
+
+    let inline squared_error_cost (target: ^a) (activations: ^a) =
+        add 1.0f target -1.0f activations 
+        >>= square
+        >>= sum
+        >>= scale (0.5f / float32 (cols target))
+
+    type StateBuilder() =
+        member inline t.Return a = fun s -> (a,s)
+        member inline t.Bind(a,f) = a >>= f
+        member inline t.ReturnFrom x = x
+
+    let state = StateBuilder()
+
+    let inline cross_entropy_cost (target: ^a) (activations: ^a) = state {
+        let lt = target
+        let! ll = log_ activations
+        let! rt = scalar_matrix_add 1.0f -1.0f target
+        let! rl = scalar_matrix_add 1.0f -1.0f activations >>= log_
+        return! linear_layer_hadmult [|lt, ll; rt, rl|] 
+                >>= sum 
+                >>= scale (-1.0f / float32 (cols target))
+        }
+
+    let maxColumnActivationModule = lazy new DeviceMaxColumnActivationModule()
+    let accuracyModule = lazy new DeviceBinaryMapSumModule("(x*y == 0.0f) ? 0.0f : 1.0f;","Accuracy")
+    /// Gets the accuracy.
+    let inline get_accuracy (targets: ^a) (activations : ^a) (state: #StanState) =
+        let a =
+            lazy
+                let o = getdMLike' targets true state
+                maxColumnActivationModule.Value.A((str state), P activations, P o)
+                accuracyModule.Value.A((str state), P targets, P o).Value
+                |> round |> int
+        a, state
+
+    /// Squared error cost that also returns the accuracy.
+    let inline squared_error_cost' (targets: ^a) (activations : ^a) (state: #StanState) =
+        para2 (get_accuracy targets) (squared_error_cost targets) activations state
+
+    /// Cross entropy cost that also returns the accuracy.
+    let inline cross_entropy_cost' (targets: ^a) (activations : ^a) (state: #StanState) =
+        para2 (get_accuracy targets) (cross_entropy_cost targets) activations state
+
+    let find_max_index (action_values : float32[]) =
+        let mutable max = Single.NegativeInfinity
+        let mutable index = -1
+        for i=0 to action_values.Length-1 do
+            let x = action_values.[i]
+            if max < x then max <- x; index <- i
+        index
+
+    /// As it says on the tin. TODO: Make initializers for other activation functions.
+    let inline reluInitializer (state: #StanState) (a: ^a) =
+        let scale = (1.0f / sqrt(addDims a |> float32))
+        fillRandomUniformMatrix((str state),a,scale,0.0f)
+        a
+
+    /// As F# does not have passing by name, the way to get that functionality is to pass messages in the form of
+    /// discriminated unions. Merely passing function does not give generic enough functionality.
+    type Optimizer =
+        | GradChecking
+        | Sgd of learning_rate: float32
+        | ClippedSgd of clipping_threshold: float32 * learning_rate: float32
+
+        member inline t.Optimize (node : ^a, state: #StanState) =
+            match t with
+            | GradChecking -> () // Does nothing. This is here so the adjoints do not get zeroed out.
+            | Sgd(learning_rate) -> 
+                saxpy (str state) -learning_rate (A' node) (P' node)
+                extract_adjoint' node |> fun x -> x.MemsetAsync(0u,(str state).Stream)
+            | ClippedSgd(clipping_threshold, learning_rate) -> 
+                gradclipModule.Value.A((str state), clipping_threshold, A node,A node)
+                saxpy (str state) -learning_rate (A' node) (P' node)
+                extract_adjoint' node |> fun x -> x.MemsetAsync(0u,(str state).Stream)
+
+    /// The wrapper type for the d2M and d4M. It is really unbelievable how much it simplified the code for the combinators.
+    /// Discriminated unions are bad for storing data, but they are excellent for making code generic by emulating calling by name
+    /// and also for doing access control. This type is for the later.
+    type DM =
+        | D2M of d2M
+        | D4M of d4M
+
+        member inline t.Dispose() =
+            match t with
+            | D2M(x) -> dispose x
+            | D4M(x) -> dispose x
+
+        member inline t.Update(o: Optimizer, s) =
+            match t with
+            | D2M(x) -> o.Optimize(x, s)
+            | D4M(x) -> o.Optimize(x, s)
+
+    type FFRec<'state when 'state :> StanState> =
+        {
+        W: d2M
+        b: d2M
+        w: 'state -> 'state
+        a: d2M -> 'state -> d2M * 'state
+        }
+
+        member inline t.Run(x: d2M) = 
+            fun state ->
+                linear_layer_matmult [|t.W,x|] (Some t.b) state
+                |> fun (a,s) -> t.a a s // Removing this line makes the type error manifest.
+        member inline l.ToArray = [|l.W;l.b|] |> Array.map D2M
+

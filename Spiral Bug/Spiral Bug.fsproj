@@ -56,10 +56,9 @@
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
     <None Include="App.config" />
-    <Compile Include="SpiralV4.fs" />
-    <Compile Include="Program.fs" />
     <Content Include="packages.config" />
     <None Include="readme.md" />
+    <Compile Include="SpiralV4.fs" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="CudaBitmapSource">
