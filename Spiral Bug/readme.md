@@ -1,1 +1,1 @@
-﻿A temporary repo made to isolate the [NUnit testing bug](https://github.com/nunit/nunit/issues/1773). It will be removed when the issue is resolved.
+﻿A minimalist example for the [SO question](http://stackoverflow.com/questions/39347296/is-it-possible-to-make-type-abbreviations-with-member-constraints/39348452?noredirect=1#comment66029901_39348452).

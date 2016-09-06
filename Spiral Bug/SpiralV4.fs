@@ -1928,6 +1928,6 @@ module Main =
         member inline t.Run(x: d2M) = 
             fun state ->
                 linear_layer_matmult [|t.W,x|] (Some t.b) state
-                |> fun (a,s) -> t.a a s // Removing this line makes the type error manifest.
+                //|> fun (a,s) -> t.a a s // Adding this line makes the type error manifest.
         member inline l.ToArray = [|l.W;l.b|] |> Array.map D2M
 
